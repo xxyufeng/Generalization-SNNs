@@ -20,16 +20,6 @@ def l2_normalize_tensor(tensor):
     # norm = tensor.view(tensor.size(0), -1).norm(p=2, dim=1, keepdim=True)  # (C, 1)
     return tensor / (norm + eps)
 
-class BinarySubset(torch.utils.data.Dataset):
-    def __init__(self, subset, top2):
-        self.subset = subset
-        self.top2 = top2
-    def __len__(self):
-        return len(self.subset)
-    def __getitem__(self, idx):
-        x, y = self.subset[idx]
-        y = 0 if y == self.top2[0] else 1
-        return x, y
 
 # train the model for one epoch on the given set
 def train(args, model, device, train_loader, criterion, optimizer, epoch):
@@ -45,15 +35,16 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
         # compute the output
         output = model(data)
 
-        if args.nclasses == 1:
-            output = output.squeeze(1)                      # shape (B,)
-            loss = criterion(output, target.float())
-            pred = (output > 0).long()                      # logits>0 -> class 1
-        else:
-            loss = criterion(output, target)
-            pred = output.max(1)[1]
+        loss = criterion(output, target)
 
-        sum_correct += pred.eq(target).sum().item()
+        # criteria: Top-1 class
+        # pred = output.max(1)[1]
+        # sum_correct += pred.eq(target).sum().item()
+
+        # criteria: Top-2 class
+        top2_pred = output.topk(2, dim=1).indices
+        sum_correct += top2_pred.eq(target.unsqueeze(1)).any(dim=1).sum().item()
+        
         sum_loss += len(data) * loss.item()
 
         optimizer.zero_grad()
@@ -67,7 +58,7 @@ def validate(args, model, device, val_loader, criterion):
     sum_loss, sum_correct = 0, 0
     margin = torch.tensor([]).to(device)
 
-    # model.eval()
+    model.eval()
     with torch.no_grad():
         for i, (data, target) in enumerate(val_loader):
             data = data.to(device).view(data.size(0), -1)
@@ -75,21 +66,22 @@ def validate(args, model, device, val_loader, criterion):
 
             output = model(data)
 
-            if args.nclasses == 1:
-                output_s = output.squeeze(1)
-                loss = criterion(output_s, target.float())
-                pred = (output_s > 0).long()
-                margin = torch.cat((margin, output_s * (2 * target.float() - 1)), 0)
-            else:
-                loss = criterion(output, target)
-                pred = output.max(1)[1]
-                # original multiclass margin calculation
-                output_m = output.clone()
-                for k in range(target.size(0)):
-                    output_m[k, target[k]] = output_m[k, :].min()
-                margin = torch.cat((margin, output[:, target].diag() - output_m[:, output_m.max(1)[1]].diag()), 0)
+            loss = criterion(output, target)
+            
 
-            sum_correct += pred.eq(target).sum().item()
+            output_m = output.clone()
+            for k in range(target.size(0)):
+                output_m[k, target[k]] = output_m[k, :].min()
+            margin = torch.cat((margin, output[:, target].diag() - output_m[:, output_m.max(1)[1]].diag()), 0)
+
+            # criteria: Top-1 class
+            # pred = output.max(1)[1]
+            # sum_correct += pred.eq(target).sum().item()
+    
+            # criteria: Top-2 class
+            top2_pred = output.topk(2, dim=1).indices
+            sum_correct += top2_pred.eq(target.unsqueeze(1)).any(dim=1).sum().item()
+
             sum_loss += len(data) * loss.item()
 
         val_margin = np.percentile(margin.cpu().numpy(), 10)
@@ -97,30 +89,16 @@ def validate(args, model, device, val_loader, criterion):
     return 1 - (sum_correct / len(val_loader.dataset)), sum_loss / len(val_loader.dataset), val_margin
 
 
-class TabularNormalize:
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-    def __call__(self, x):
-        return (x - self.mean) / self.std
-
 # Load and Preprocess data.
 # Loading: If the dataset is not in the given directory, it will be downloaded.
 # Preprocessing: This includes normalizing each channel and data augmentation by random cropping and horizontal flipping
-def load_data(split, dataset_name, datadir, nclasses, mean=None, std=None):
+def load_data(split, dataset_name, datadir):
     # L_2 normalization
     normalize = transforms.Lambda(l2_normalize_tensor)
     is_vision = dataset_name in ['SVHN', 'CIFAR10', 'CIFAR100', 'MNIST']
 
     # Use base transforms to compute statistics or use provided mean/std
-    if is_vision:
-        if mean is not None and std is not None:
-            #Giving provided mean and std, we can directly use them for normalization without computing from the data
-            transf = transforms.Compose([transforms.Resize(32), transforms.ToTensor(), transforms.Normalize(mean, std), normalize])
-        else:
-            transf = transforms.Compose([transforms.Resize(32), transforms.ToTensor()])
-    else:
-        transf = transforms.Compose([normalize])
+    transf = transforms.Compose([transforms.Resize(32), transforms.ToTensor(), normalize])
 
     if dataset_name == 'SVHN':
         get_dataset = getattr(datasets, dataset_name)
@@ -139,55 +117,6 @@ def load_data(split, dataset_name, datadir, nclasses, mean=None, std=None):
         if transf is not None:
             dataset.transform = transf
 
-    if nclasses == 1:
-        # choose top-2 most frequent labels and remap to {0,1}
-        targets = np.array(dataset.targets) if hasattr(dataset, 'targets') else np.array([t for _, t in dataset])
-        counts = Counter(targets)
-        if dataset_name == 'CIFAR10':
-            top2 = [3, 5]  # predefined for CIFAR10 (cat and dog)
-        elif dataset_name =='MNIST':
-            top2 = [1, 7]  # predefined for MNIST (digit 1 and 7)
-        elif dataset_name == 'SVHN':
-            top2 = [1, 2]  # predefined for SVHN (digit 1 and 2)
-        # else:
-            # top2 = [list(counts.keys())[0], list(counts.keys())[1]] if len(counts) > 1 else [list(counts.keys())[0], 0]
-
-        if is_vision:
-            inds = [i for i, t in enumerate(targets) if t in top2]
-            print(f"Selected top-2 classes: {top2} with counts: {[counts[top2[0]], counts[top2[1]]]}")
-            base_subset = torch.utils.data.Subset(dataset, inds)
-            dataset = BinarySubset(base_subset, top2)
-
-    if mean is None and std is None:
-        if is_vision:
-            print(f"Computing mean and std for {split} selected dataset...")
-            loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
-            channels = 3 if dataset_name == 'CIFAR10' or dataset_name == 'SVHN' else 1
-            mean_sum = torch.zeros(channels)
-            sq_mean_sum = torch.zeros(channels)
-            num_pixels = 0
-            for data, _ in loader:
-                b, c, h, w = data.shape
-                mean_sum += data.sum(dim=[0, 2, 3])
-                sq_mean_sum += (data ** 2).sum(dim=[0, 2, 3])
-                num_pixels += b * h * w
-                
-            mean = (mean_sum / num_pixels).tolist()
-            std = torch.sqrt((sq_mean_sum / num_pixels) - (mean_sum / num_pixels) ** 2).tolist()
-            print(f"Calculated mean: {mean}, std: {std}")
-            final_transform = transforms.Compose([transforms.Resize(32), transforms.ToTensor(), normalize])
-        else:
-            mean = 0.0
-            std = 1.0
-            final_transform = transforms.Compose([normalize])
-
-        if hasattr(dataset, 'subset'): # if wrapped in BinarySubset
-            dataset.subset.dataset.transform = final_transform
-        else:
-            dataset.transform = final_transform
-
-    if split == 'train':
-        return dataset, mean, std
     return dataset
 
 
@@ -196,10 +125,10 @@ def load_data(split, dataset_name, datadir, nclasses, mean=None, std=None):
 def main():
     '''
     Usage example:
-    !python main_binary.py --dataset MNIST --nclasses 1
-        --nunits 64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144
-        --epochs 20 --batchsize 256 --learningrate 0.001 --momentum 0.9 --stopcond 0.1
-        --random 42,52,62,72,82 --frez2 train --initmodel normal --outputdir results --modeldir models
+    !python main_multiclass.py --dataset MNIST --nclasses 10 
+    --nunits 64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072 
+    --epochs 20 --batchsize 2048 --learningrate 0.0005 --momentum 0.9 --stopcond 0.5 
+    --random 42,52,62,72 --frez2 train --initmodel normal --outputdir results_20260812 --modeldir models_20260812
     '''
 
     # settings
@@ -241,7 +170,7 @@ def main():
 
     for random_seed in random_list:
         args.random = random_seed
-        print(f'\n===== Random Seed: {args.random} =====\n')
+        print(f'===== Random Seed: {args.random} =====')
         for nunits in nunits_list:
             torch.manual_seed(args.random)
             np.random.seed(args.random)
@@ -258,8 +187,8 @@ def main():
             if args.dataset == 'CIFAR100': nclasses = 100
 
             # loading data
-            train_dataset, d_mean, d_std = load_data('train', args.dataset, args.datadir, nclasses)
-            val_dataset = load_data('val', args.dataset, args.datadir, nclasses, mean=d_mean, std=d_std)
+            train_dataset = load_data('train', args.dataset, args.datadir)
+            val_dataset = load_data('val', args.dataset, args.datadir)
 
             train_loader = DataLoader(train_dataset, batch_size=args.batchsize, shuffle=True, **kwargs)
             val_loader = DataLoader(val_dataset, batch_size=args.batchsize, shuffle=False, **kwargs)
@@ -321,10 +250,8 @@ def main():
 
             # define loss function (criterion) and optimizer
             criterion = nn.CrossEntropyLoss().to(device)
-            if nclasses == 1:
-                criterion = nn.BCEWithLogitsLoss().to(device)
-            # optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), args.learningrate, momentum=args.momentum)
-            optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), args.learningrate)
+            optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), args.learningrate, momentum=args.momentum)
+            # optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), args.learningrate)
 
             # training the model
             tr_err, tr_loss, val_margin = validate(args, model, device, train_loader, criterion)
@@ -349,7 +276,7 @@ def main():
                 path_norm = measure['path_norm']
                 print(f'Epoch: {epoch + 1}/{args.epochs}\t Training loss: {tr_loss:.3f}\t',
                         f'Training error: {tr_err:.3f}\t Validation error: {val_err:.3f}\t',
-                        f'Dist_Fro: {Dist_Fro:.6f}\t Path_norm: {path_norm:.6f}\n')
+                        f'Dist_Fro: {Dist_Fro:.6f}\t Path_norm: {path_norm:.6f}')
 
                 # stop training if the cross-entropy loss is less than the stopping condition
                 if tr_err < args.stopcond: break
@@ -375,27 +302,9 @@ def main():
             #         os.path.join(args.modeldir,
             #             f'trained_model_nunits{nunits}_{args.dataset}_{args.initmodel}_2thlayer{args.frez2}_epoch{args.epochs}_bs{args.batchsize}_lr{lr_str}_sp{sp_str}_rs{args.random}.pth'))
 
-            # measure = measures.calculate(model, init_model, device, train_loader, tr_margin)
+            measure = measures.calculate(model, init_model, device, train_loader, tr_margin)
             for key, value in measure.items():
                 print(f'{key:s}:\t {float(value):3.3}')
-            
-            # Plot path norm distribution
-            from measures import cal_path_norm_distribution
-            ratio_dist = cal_path_norm_distribution(model, init_model)
-            
-            # cut off the top 1% of the distribution to avoid outliers dominating the plot
-            cutoff = np.percentile(ratio_dist, 99)
-            filtered_ratio_dist = ratio_dist[ratio_dist <= cutoff]
-
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            plt.figure(figsize=(8, 6))
-            sns.histplot(filtered_ratio_dist, bins=100, kde=True, stat='percent')
-            plt.xlabel(r'$\|w_j - w^0_j\| / \|v_j\|$', fontsize=18)
-            plt.ylabel('Percent', fontsize=14)
-            plt.title(f'Dist ({args.dataset}, init: {args.initmodel}, m: {nunits}, max: {cutoff:.3f})')
-            plt.savefig(os.path.join(args.outputdir, f'ratio_dist_{args.dataset}_{args.initmodel}_m{nunits}.png'))
-            plt.close()
 
             # save results to CSV
             if not os.path.exists(args.outputdir):
